@@ -2,22 +2,43 @@
 pragma solidity ^0.8.13;
 
 import {ERC20} from "openzeppelin-contracts/contracts/token/ERC20/ERC20.sol";
+import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
+import {ReentrancyGuard} from "openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
 
-contract TokenBase is ERC20 {
-    address public assetAdmin;           // текущий админ актива, сверяется при каждом вызове admin-функций
-    address public priceAuthority;       // кто имеет право обновлять курс обмена; по умолчанию равен assetAdmin
-    address public stablecoinToken;      // адрес ERC-20 стейблкоина, в котором торгуется этот актив
-    string  public uri;                  // ссылка на off-chain документ/описание актива; изменяемо
-    string  public isin;                 // просто строковое поле, без валидации/бизнес-логики; изменяемо
-    string  public jurisdiction;         // просто метаданные, без встроенных правил допуска; изменяемо
-    uint16  public mintFeeBps;           // комиссия при mint в базисных пунктах, 20 = 0.2%
-    uint16  public redemptionFeeBps;     // комиссия при redemption в базисных пунктах
-    address public issuerTreasury;       // адрес (в stablecoinToken), куда поступают деньги инвестора при mint (принципал, за вычетом fee)
-    address public redemptionSource;     // адрес (в stablecoinToken), с которого списываются деньги инвестору при redemption; может совпадать с issuerTreasury
-    bool    public isClosed;             // если true — актив закрыт через closeAsset, дальнейшие mint/redeem/transfer заблокированы
-    uint256 public currentRate;          // курс обмена stablecoin↔asset, обновляется через updateExchangeRate
-    uint256 public maxTotalSupply;           // максимальное количество токенов, которое может быть выпущено;
-    address private pendingAssetAdmin;      // адрес, которому предложено право стать новым assetAdmin; для двухшаговой передачи прав
+contract TokenBase is ERC20, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    uint256 private constant BPS_DENOMINATOR = 10_000;
+    uint256 private constant RATE_PRECISION = 1e18;
+
+    address public assetAdmin;           // The current asset admin is verified each time an admin function is called
+    address public priceAuthority;       // Who has the authority to update the exchange rate
+    address public stablecoinToken;      // The ERC-20 address of the stablecoin on which this asset is traded
+    string  public uri;                  // The reference to some off-chain information
+    string  public isin;                 // International Securities Identification Number (ISIN) for the asset; just metadata, no built-in rules; mutable
+    string  public jurisdiction;         // Jurisdiction of the asset; just metadata, no built-in rules; mutable
+    uint16  public mintFeeBps;           // Mint commission in basis points, 20 = 0.2%
+    uint16  public redemptionFeeBps;     // Redemption fee in basis points
+    address public issuerTreasury;       // Address (in stablecoinToken) where the investor's funds are sent upon minting (minus the fee)
+    address public redemptionSource;     // The address (in `stablecoinToken`) from which funds are debited to the investor upon redemption; may be the same as `issuerTreasury`
+    bool    public isClosed;             // If true, the asset is closed via `closeAsset`, and further `mint`, `redeem`, and `transfer` operations are blocked
+    uint256 public currentRate;          // Stablecoin↔asset exchange rate, updated via `updateExchangeRate`
+    uint256 public maxTotalSupply;       // The maximum number of tokens that can be issued;
+    address private pendingAssetAdmin;   // The address that has been offered the right to become the new assetAdmin; for a two-step transfer of rights
+
+    event MetadataUpdated(string uri, string isin, string jurisdiction);
+    event TreasuryAddressesUpdated(address newIssuerTreasury, address newRedemptionSource);
+    event PriceAuthorityUpdated(address newPriceAuthority);
+    event ExchangeRateUpdated(uint256 newRate);
+    event FeesUpdated(uint16 newMintFeeBps, uint16 newRedemptionFeeBps);
+    event FeesWithdrawn(address destination, uint256 amount);
+    event Minted(address indexed investor, uint256 stablecoinAmount, uint256 assetAmount);
+    event Redeemed(address indexed investor, uint256 assetAmount, uint256 stablecoinAmount);
+    event AuthorityTransferProposed(address indexed currentAdmin, address indexed proposedAdmin);
+    event AuthorityTransferAccepted(address indexed previousAdmin, address indexed newAdmin);
+    event AuthorityTransferCancelled(address indexed currentAdmin, address indexed cancelledAdmin);
+    event AssetClosed();
 
     constructor(
         AssetTokenParams memory _config
@@ -80,8 +101,7 @@ contract TokenBase is ERC20 {
         string calldata _isin,
         string calldata _jurisdiction
     ) external onlyAssetAdmin {
-        // Пустая строка "" означает "не менять" — вызывающий передаёт текущее значение,
-        // если не хочет обновлять конкретное поле. Явного sentinel-типа (Optional) в Solidity нет.
+        // An empty string “” means “do not change”.
         if (bytes(_uri).length > 0) {
             uri = _uri;
         }
@@ -91,6 +111,7 @@ contract TokenBase is ERC20 {
         if (bytes(_jurisdiction).length > 0) {
             jurisdiction = _jurisdiction;
         }
+        emit MetadataUpdated(uri, isin, jurisdiction);
     }
 
     function updateTreasuryAddresses(
@@ -100,40 +121,42 @@ contract TokenBase is ERC20 {
         require(newIssuerTreasury != address(0) && newRedemptionSource != address(0), "zero address");
         issuerTreasury = newIssuerTreasury;
         redemptionSource = newRedemptionSource;
+        emit TreasuryAddressesUpdated(newIssuerTreasury, newRedemptionSource);
     }
 
     function updatePriceAuthority(address newPriceAuthority) external onlyAssetAdmin {
         require(newPriceAuthority != address(0), "zero address");
         priceAuthority = newPriceAuthority;
+        emit PriceAuthorityUpdated(newPriceAuthority);
     }
 
     function updateExchangeRate(uint256 newRate) external onlyPriceAuthority {
         require(newRate > 0, "rate must be > 0");
         currentRate = newRate;
+        emit ExchangeRateUpdated(newRate);
     }
 
     function updateFees(uint16 newMintFeeBps, uint16 newRedemptionFeeBps) external onlyAssetAdmin {
         require(newMintFeeBps <= 10_000 && newRedemptionFeeBps <= 10_000, "fee > 100%");
         mintFeeBps = newMintFeeBps;
         redemptionFeeBps = newRedemptionFeeBps;
+        emit FeesUpdated(newMintFeeBps, newRedemptionFeeBps);
+    }
+
+    function withdrawFees(address destination) external onlyAssetAdmin {
+        require(destination != address(0), "zero address");
+        uint256 balance = ERC20(stablecoinToken).balanceOf(address(this));
+        require(balance > 0, "nothing to withdraw");
+        IERC20(stablecoinToken).safeTransfer(destination, balance);
+        emit FeesWithdrawn(destination, balance);
     }
 
     // ---------------------------------------------------------------------
     // Mint / Redeem (investor-facing)
     // ---------------------------------------------------------------------
 
-    uint256 private constant BPS_DENOMINATOR = 10_000;
-    uint256 private constant RATE_PRECISION = 1e18;
-    // ASSUMPTION (в этом куске ТЗ mint/redeem не описаны — этого требует пользователь,
-    // реализация "по логике курса обмена и существующих параметров"):
-    // currentRate выражен с точностью 1e18 и означает "сколько stablecoin в целых единицах
-    // (не в сырых base units, т.е. независимо от decimals стейблкоина) стоит 1 asset token".
-    // Например currentRate = 1.05e18 значит "1 asset token = 1.05 stablecoin".
-    // _stablecoinDecimals используется здесь для перевода между сырыми unit'ами стейблкоина
-    // (то, что реально лежит на балансах) и нормализованными 18-значными величинами для расчёта по rate.
-    // Если реальная договорённость про rate иная — эту часть придётся переписать.
-
-    function mint(uint256 stablecoinAmount) external returns (uint256 assetAmount) {
+    function mint(uint256 stablecoinAmount) external nonReentrant returns (uint256 assetAmount) {
+        require(!isClosed, "asset closed");
         require(stablecoinAmount > 0, "amount must be > 0");
 
         uint256 feeRaw = (stablecoinAmount * mintFeeBps) / BPS_DENOMINATOR;
@@ -141,10 +164,9 @@ contract TokenBase is ERC20 {
 
         // Забираем всю сумму у инвестора: net идёт в issuerTreasury (принципал),
         // fee остаётся на балансе самого AssetToken (нет отдельного feeVault) — выводится через withdrawFees.
-        ERC20(stablecoinToken).transferFrom(msg.sender, issuerTreasury, netRaw);
+        IERC20(stablecoinToken).safeTransferFrom(msg.sender, issuerTreasury, netRaw);
         if (feeRaw > 0) {
-            // require(ERC20(stablecoinToken).transferFrom(msg.sender, address(this), feeRaw), "transfer of fee failed");
-            ERC20(stablecoinToken).transferFrom(msg.sender, address(this), feeRaw);
+            IERC20(stablecoinToken).safeTransferFrom(msg.sender, address(this), feeRaw);
         }
 
         assetAmount = (netRaw * RATE_PRECISION) / currentRate; // нормализуем к 18 decimals, делим на курс, возвращаем к исходным decimals;
@@ -152,9 +174,10 @@ contract TokenBase is ERC20 {
         require(totalSupply() + assetAmount <= maxTotalSupply, "exceeds max supply");
 
         _mint(msg.sender, assetAmount); // whitelist-проверка получателя сработает внутри _update
+        emit Minted(msg.sender, stablecoinAmount, assetAmount);
     }
 
-    function redeem(uint256 assetAmount) external returns (uint256 netStablecoinOut) {
+    function redeem(uint256 assetAmount) external nonReentrant returns (uint256 netStablecoinOut) {
         require(assetAmount > 0, "amount must be > 0");
 
         _burn(msg.sender, assetAmount); // whitelist-проверка отправителя сработает внутри _update
@@ -164,10 +187,11 @@ contract TokenBase is ERC20 {
         uint256 feeRaw = (grossRaw * redemptionFeeBps) / BPS_DENOMINATOR;
         netStablecoinOut = grossRaw - feeRaw;
 
-        ERC20(stablecoinToken).transferFrom(redemptionSource, msg.sender, netStablecoinOut);
+        IERC20(stablecoinToken).safeTransferFrom(redemptionSource, msg.sender, netStablecoinOut);
         if (feeRaw > 0) {
-            ERC20(stablecoinToken).transferFrom(redemptionSource, address(this), feeRaw);
+            IERC20(stablecoinToken).safeTransferFrom(redemptionSource, address(this), feeRaw);
         }
+        emit Redeemed(msg.sender, assetAmount, netStablecoinOut);
     }
 
     // ---------------------------------------------------------------------
@@ -177,16 +201,21 @@ contract TokenBase is ERC20 {
     function proposeAuthorityTransfer(address newAdmin) external onlyAssetAdmin {
         require(newAdmin != address(0), "zero address");
         pendingAssetAdmin = newAdmin;
+        emit AuthorityTransferProposed(assetAdmin, newAdmin);
     }
 
     function acceptAuthorityTransfer() external {
         require(msg.sender == pendingAssetAdmin, "not pending admin");
+        address previousAdmin = assetAdmin;
         assetAdmin = pendingAssetAdmin;
         pendingAssetAdmin = address(0);
+        emit AuthorityTransferAccepted(previousAdmin, assetAdmin);
     }
 
     function cancelAuthorityTransfer() external onlyAssetAdmin {
+        address cancelled = pendingAssetAdmin;
         pendingAssetAdmin = address(0);
+        emit AuthorityTransferCancelled(assetAdmin, cancelled);
     }
 
     // ---------------------------------------------------------------------
@@ -196,6 +225,6 @@ contract TokenBase is ERC20 {
     function closeAsset() external onlyAssetAdmin {
         require(totalSupply() == 0, "supply not zero");
         isClosed = true;
-        // emit AssetClosed();
+        emit AssetClosed();
     }
 }
