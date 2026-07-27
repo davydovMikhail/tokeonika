@@ -10,8 +10,13 @@ contract AssetFactory {
     mapping(address => bool) public isRegisteredAsset;
     address[] public allAssets;
 
+    /// @notice Emitted when a new asset token is deployed and registered
+    /// @param assetToken Address of the newly deployed asset token contract
+    /// @param assetType Admission model the asset was deployed with (Whitelist / Blacklist / Free)
     event AssetCreated(address indexed assetToken, TypeAsset assetType);
 
+    /// @notice Selects which asset token implementation createAsset deploys
+    /// @dev Whitelist -> AssetV1 (default-deny, admission via whitelist); Blacklist -> AssetV2 (default-allow, admission via blacklist); Free -> bare TokenBase (no admission checks, no pause, no forced actions)
     enum TypeAsset {
         Whitelist, // 0 - deploy AssetV1 with whitelist 
         Blacklist, // 1 - deploy AssetV2 with blacklist 
@@ -21,6 +26,11 @@ contract AssetFactory {
     constructor() {
     }
 
+    /// @notice Deploys a new asset token and registers it with the factory
+    /// @dev Intentionally callable by anyone — this is a deliberate testnet/demo choice, not the intended production behavior; restricting to a platform admin role is a known backlog item. Validates required config fields and fee/rate bounds before deployment, then dispatches to the corresponding implementation based on assetType
+    /// @param assetType Admission model to deploy (Whitelist / Blacklist / Free)
+    /// @param config Full set of asset parameters passed through to the token's constructor (see TokenBase.AssetTokenParams)
+    /// @return assetToken Address of the newly deployed asset token
     function createAsset(
         TypeAsset assetType,
         TokenBase.AssetTokenParams memory config
@@ -61,6 +71,9 @@ contract AssetFactory {
         emit AssetCreated(assetToken, assetType);
     }
 
+    /// @notice Returns the total number of assets deployed through this factory
+    /// @dev Reads allAssets.length; useful for indexers/off-chain paginating over allAssets
+    /// @return uint256 Count of registered assets
     function totalAssets() external view returns (uint256) {
         return allAssets.length;
     }
