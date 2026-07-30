@@ -57,7 +57,7 @@ contract AssetV1 is TokenBase, Pausable {
     }
 
     /// @notice Grants admission to the given address
-    /// @dev Callable only by assetAdmin. Adds to the deny-list (default-allow model) — for AssetV2 this revokes admission rather than granting it
+    /// @dev Callable only by assetAdmin. Adds to the allow-list (default-deny model) — the address becomes admitted only after this call
     /// @param investor Address to add to the list
     function addToWhitelist(address investor) external onlyAssetAdmin {
         isWhitelisted[investor] = true;
