@@ -14,8 +14,7 @@ import {Ownable} from "openzeppelin-contracts/contracts/access/Ownable.sol";
 ///      Ownable2Step protects against a typo'd address during a voluntary handoff: the
 ///      new owner must explicitly call acceptOwnership() before control actually transfers.
 ///      It does NOT protect against key loss — if the current Platform Admin loses access
-///      to their key, there is no recovery path; this is an accepted risk (see project TZ,
-///      section 8).
+///      to their key, there is no recovery path; this is an accepted risk
 ///
 ///      Other contracts (e.g. AssetFactory) reference this contract's owner() through the
 ///      minimal IPlatformConfig interface rather than importing Ownable2Step directly, to
